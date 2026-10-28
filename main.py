@@ -10,6 +10,7 @@ from rich.table import Table
 
 from analyzer import ArbitrageDeal, calculate_profit, is_liquid
 from config import Settings, get_settings
+from database import add_subscriber, get_active_subscribers
 from market_client import MarketListing, MockMarketClient
 from notifier import TelegramNotifier
 
@@ -85,10 +86,7 @@ def create_items_table(
         else:
             liquidity_status = f"[red]🔴 Неликвиден ({item.sales_last_24h}/24ч)[/red]"
 
-        # Цветовая индикация:
-        # зеленый — профит >= min_profit_percent;
-        # желтый — около порога (10-14%);
-        # серый — нет выгоды.
+        # Цветовая индикация
         sign = "+" if profit_percent > 0 else ""
         profit_str = f"{net_profit:+.2f} ₽ ({sign}{profit_percent:.2f}%)"
 
@@ -238,7 +236,7 @@ async def run_dashboard(once: bool = False) -> None:
 
 
 async def run_test_alert() -> bool:
-    """Отправляет тестовую карточку в Telegram и выводит статус в консоль."""
+    """Отправляет тестовую карточку в Telegram подписчикам и выводит статус в консоль."""
     settings = get_settings()
     console.print("[bold cyan]🔔 Проверка связи с Telegram...[/bold cyan]")
 
@@ -247,10 +245,13 @@ async def run_test_alert() -> bool:
         if settings.telegram_bot_token
         else "[red]не задан[/red]"
     )
-    chat_id_display = settings.telegram_chat_id or "[red]не задан[/red]"
+    active_subs = get_active_subscribers(settings.database_path)
+    subs_info = f"{len(active_subs)} чел." if active_subs else "[red]нет (база пуста)[/red]"
 
     console.print(f"• Токен бота: [yellow]{masked_token}[/yellow]")
-    console.print(f"• Chat ID: [yellow]{chat_id_display}[/yellow]")
+    console.print(f"• Подписчиков в БД: [yellow]{subs_info}[/yellow]")
+    if settings.telegram_chat_id:
+        console.print(f"• Fallback Chat ID: [yellow]{settings.telegram_chat_id}[/yellow]")
 
     test_deal = ArbitrageDeal(
         item_name="AK-47 | Redline (Field-Tested) [TEST ALERT]",
@@ -267,7 +268,7 @@ async def run_test_alert() -> bool:
     if success:
         console.print(f"[bold green]✔ УСПЕХ:[/bold green] {reason}")
     else:
-        console.print(f"[bold red]✖ ОШИБКА:[/bold red] {reason}")
+        console.print(f"[bold red]✖ СТАТУС:[/bold red] {reason}")
 
     return success
 
@@ -287,7 +288,31 @@ def main() -> None:
         action="store_true",
         help="Отправить тестовую карточку в Telegram для проверки связи и вывести статус",
     )
+    parser.add_argument(
+        "--add-subscriber",
+        type=int,
+        metavar="CHAT_ID",
+        help="Добавить Chat ID подписчика в базу данных",
+    )
+    parser.add_argument(
+        "--subscribers",
+        action="store_true",
+        help="Показать список всех активных подписчиков",
+    )
     args = parser.parse_args()
+
+    settings = get_settings()
+
+    if args.add_subscriber:
+        add_subscriber(args.add_subscriber, db_path=settings.database_path)
+        msg = f"[bold green]✔ Подписчик {args.add_subscriber} успешно добавлен.[/bold green]"
+        console.print(msg)
+        return
+
+    if args.subscribers:
+        subs = get_active_subscribers(settings.database_path)
+        console.print(f"[bold cyan]Список подписчиков ({len(subs)}):[/bold cyan] {subs}")
+        return
 
     try:
         if args.test_alert:

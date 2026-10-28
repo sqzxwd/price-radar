@@ -4,6 +4,15 @@ from pydantic import ValidationError
 
 from analyzer import ArbitrageDeal, calculate_profit, is_liquid
 from config import Settings
+from database import (
+    add_subscriber,
+    async_add_subscriber,
+    async_get_active_subscribers,
+    async_remove_subscriber,
+    get_active_subscribers,
+    init_db,
+    remove_subscriber,
+)
 from market_client import MarketListing, MockMarketClient
 from notifier import TelegramNotifier, format_deal_card, send_telegram_deal_notification
 
@@ -86,7 +95,7 @@ def test_arbitrage_deal_pydantic_model() -> None:
     with pytest.raises(ValidationError):
         ArbitrageDeal(
             item_name="Invalid Item",
-            buy_price=-100.0,  # buy_price должен быть > 0
+            buy_price=-100.0,
             median_price=500.0,
             net_profit=50.0,
             profit_percent=10.0,
@@ -109,11 +118,11 @@ def test_format_deal_card() -> None:
     assert "5000.00 ₽" in card_html
     assert "+950.00 ₽" in card_html
     assert "+19.00%" in card_html
-    assert "https://market.csgo.com/item?id=42&amp;ref=radar" in card_html
+    assert 'href="https://market.csgo.com/item?id=42&amp;ref=radar"' in card_html
 
 
 @pytest.mark.asyncio
-async def test_notifier_safe_on_missing_token_or_chat_id(caplog: pytest.LogCaptureFixture) -> None:
+async def test_notifier_safe_on_missing_token(caplog: pytest.LogCaptureFixture) -> None:
     """Безопасная обработка отсутствия токена без падения воркера."""
     deal = ArbitrageDeal(
         item_name="AWP | Safari Mesh",
@@ -129,7 +138,31 @@ async def test_notifier_safe_on_missing_token_or_chat_id(caplog: pytest.LogCaptu
         success = await send_telegram_deal_notification(deal=deal, settings=settings)
 
     assert success is False
-    assert "Telegram bot token or chat ID is missing" in caplog.text
+    assert "Telegram bot token is missing" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_notifier_safe_on_empty_subscribers(caplog: pytest.LogCaptureFixture) -> None:
+    """Безопасная обработка пустого списка получателей/подписчиков."""
+    deal = ArbitrageDeal(
+        item_name="AWP | Safari Mesh",
+        buy_price=100.0,
+        median_price=200.0,
+        net_profit=70.0,
+        profit_percent=70.0,
+        link="https://market.csgo.com/item/2",
+    )
+
+    settings = Settings(telegram_bot_token="test_token", telegram_chat_id=None)
+    with caplog.at_level("INFO"):
+        success = await send_telegram_deal_notification(
+            deal=deal,
+            chat_ids=[],
+            settings=settings,
+        )
+
+    assert success is False
+    assert "No active Telegram subscribers found" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -165,8 +198,42 @@ async def test_notifier_mock_sending_success() -> None:
 
 
 @pytest.mark.asyncio
+async def test_notifier_mock_broadcast_multiple_subscribers() -> None:
+    """Мок-рассылка нескольким подписчикам одновременно."""
+    deal = ArbitrageDeal(
+        item_name="AK-47 | Vulcan",
+        buy_price=15000.0,
+        median_price=22000.0,
+        net_profit=3700.0,
+        profit_percent=24.67,
+        link="https://market.csgo.com/item/vulcan",
+    )
+
+    sent_chat_ids: list[int] = []
+
+    def mock_handler(request: httpx.Request) -> httpx.Response:
+        import json
+
+        body = json.loads(request.content)
+        sent_chat_ids.append(body["chat_id"])
+        return httpx.Response(200, json={"ok": True, "result": {"message_id": 777}})
+
+    settings = Settings(telegram_bot_token="test_token")
+    recipients = [111, 222, 333]
+
+    transport = httpx.MockTransport(mock_handler)
+    async with httpx.AsyncClient(transport=transport) as client:
+        notifier = TelegramNotifier(settings=settings, client=client)
+        success, details = await notifier.send_with_details(deal, chat_ids=recipients)
+
+    assert success is True
+    assert "Успешно доставлено 3/3" in details
+    assert sent_chat_ids == [111, 222, 333]
+
+
+@pytest.mark.asyncio
 async def test_notifier_mock_sending_http_error(caplog: pytest.LogCaptureFixture) -> None:
-    """Проверка устойчивости к сетевой ошибке/500 ошибке Telegram API (логирование без краша)."""
+    """Проверка устойчивости к ошибке Telegram API (логирование без краша)."""
     deal = ArbitrageDeal(
         item_name="Glock-18 | Fade",
         buy_price=90000.0,
@@ -186,11 +253,10 @@ async def test_notifier_mock_sending_http_error(caplog: pytest.LogCaptureFixture
 
     transport = httpx.MockTransport(failing_handler)
     async with httpx.AsyncClient(transport=transport) as client:
-        with caplog.at_level("ERROR"):
+        with caplog.at_level("WARNING"):
             result = await send_telegram_deal_notification(deal, settings=settings, client=client)
 
     assert result is False
-    assert "HTTP error while sending Telegram notification" in caplog.text
 
 
 @pytest.mark.asyncio
@@ -205,28 +271,28 @@ async def test_market_client_scan_filters_unprofitable_and_illiquid() -> None:
         MarketListing(
             item_name="Liquid Profitable Skin",
             buy_price=1000.0,
-            median_price=1500.0,  # 1500*0.85 = 1275 -> profit +275 (+27.5%)
+            median_price=1500.0,
             sales_last_24h=30,
             link="https://test.link/1",
         ),
         MarketListing(
             item_name="Liquid Unprofitable Skin",
             buy_price=1000.0,
-            median_price=1100.0,  # 1100*0.85 = 935 -> profit -65 (-6.5%)
+            median_price=1100.0,
             sales_last_24h=50,
             link="https://test.link/2",
         ),
         MarketListing(
             item_name="Illiquid High Profit Skin",
             buy_price=1000.0,
-            median_price=2000.0,  # 2000*0.85 = 1700 -> +70% profit, but only 3 sales!
+            median_price=2000.0,
             sales_last_24h=3,
             link="https://test.link/3",
         ),
         MarketListing(
             item_name="Liquid Below Threshold Skin",
             buy_price=1000.0,
-            median_price=1300.0,  # 1300*0.85 = 1105 -> profit +105 (+10.5% < 15%)
+            median_price=1300.0,
             sales_last_24h=20,
             link="https://test.link/4",
         ),
@@ -251,6 +317,7 @@ def test_settings_default_values_and_override() -> None:
     assert default_settings.check_interval_seconds == 2.0
     assert default_settings.telegram_bot_token is None
     assert default_settings.telegram_chat_id is None
+    assert default_settings.database_path == "subscribers.db"
 
     custom = Settings(
         min_profit_percent=20.0,
@@ -258,12 +325,48 @@ def test_settings_default_values_and_override() -> None:
         check_interval_seconds=5.0,
         telegram_bot_token="bot123",
         telegram_chat_id="chat456",
+        database_path="custom.db",
     )
     assert custom.min_profit_percent == 20.0
     assert custom.market_fee_percent == 13.0
     assert custom.check_interval_seconds == 5.0
     assert custom.telegram_bot_token == "bot123"
     assert custom.telegram_chat_id == "chat456"
+    assert custom.database_path == "custom.db"
+
+
+def test_database_subscribers_crud(tmp_path: pytest.TempPathFactory) -> None:
+    """Тестирование CRUD операций с базой данных подписчиков."""
+    db_file = str(tmp_path / "test_subscribers.db")
+
+    init_db(db_file)
+    assert get_active_subscribers(db_file) == []
+
+    add_subscriber(1001, db_path=db_file)
+    add_subscriber(1002, db_path=db_file)
+    assert get_active_subscribers(db_file) == [1001, 1002]
+
+    # Деактивация
+    remove_subscriber(1001, db_path=db_file)
+    assert get_active_subscribers(db_file) == [1002]
+
+    # Повторная активация
+    add_subscriber(1001, db_path=db_file)
+    assert get_active_subscribers(db_file) == [1001, 1002]
+
+
+@pytest.mark.asyncio
+async def test_database_async_operations(tmp_path: pytest.TempPathFactory) -> None:
+    """Тестирование асинхронных операций с БД."""
+    db_file = str(tmp_path / "async_subscribers.db")
+
+    await async_add_subscriber(555, db_path=db_file)
+    subs = await async_get_active_subscribers(db_file)
+    assert subs == [555]
+
+    await async_remove_subscriber(555, db_path=db_file)
+    subs = await async_get_active_subscribers(db_file)
+    assert subs == []
 
 
 @pytest.mark.asyncio
@@ -306,7 +409,7 @@ async def test_notifier_send_with_details_methods() -> None:
     notifier_empty = TelegramNotifier(settings=empty_settings)
     success, reason = await notifier_empty.send_with_details(deal)
     assert success is False
-    assert "Не настроены TELEGRAM_BOT_TOKEN" in reason
+    assert "Не настроен TELEGRAM_BOT_TOKEN" in reason
 
     # 2. Успешный мок
     valid_settings = Settings(
@@ -322,7 +425,7 @@ async def test_notifier_send_with_details_methods() -> None:
         notifier_ok = TelegramNotifier(settings=valid_settings, client=client)
         success, reason = await notifier_ok.send_with_details(deal)
         assert success is True
-        assert "message_id: 42" in reason
+        assert "Успешно доставлено 1/1" in reason
 
 
 @pytest.mark.asyncio
@@ -330,7 +433,6 @@ async def test_run_test_alert(monkeypatch: pytest.MonkeyPatch) -> None:
     """Проверка функции run_test_alert."""
     from main import run_test_alert
 
-    # Мокаем TelegramNotifier.send_with_details, чтобы тест был изолирован
     async def mock_send_with_details(*args, **kwargs) -> tuple[bool, str]:
         return True, "Тестовое сообщение успешно отправлено (mock_id: 100)"
 

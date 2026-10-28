@@ -1,10 +1,12 @@
 import html
 import logging
+from collections.abc import Sequence
 
 import httpx
 
 from analyzer import ArbitrageDeal
 from config import Settings, get_settings
+from database import get_active_subscribers
 
 logger = logging.getLogger(__name__)
 
@@ -26,80 +28,118 @@ def format_deal_card(deal: ArbitrageDeal) -> str:
     )
 
 
-async def send_telegram_deal_notification_with_result(
-    deal: ArbitrageDeal,
-    settings: Settings | None = None,
-    client: httpx.AsyncClient | None = None,
+async def send_to_single_chat(
+    client: httpx.AsyncClient,
+    bot_token: str,
+    chat_id: int | str,
+    text: str,
 ) -> tuple[bool, str]:
-    """Асинхронно отправляет карточку сделки в Telegram с возвратом статуса и описания.
-
-    Возвращает (success: bool, reason: str).
-    """
-    cfg = settings or get_settings()
-
-    if not cfg.telegram_bot_token or not cfg.telegram_chat_id:
-        reason = "Telegram bot token or chat ID is missing."
-        logger.warning(
-            "%s Notification skipped for '%s'.",
-            reason,
-            deal.item_name,
-        )
-        return False, "Не настроены TELEGRAM_BOT_TOKEN или TELEGRAM_CHAT_ID в .env"
-
-    url = f"https://api.telegram.org/bot{cfg.telegram_bot_token}/sendMessage"
+    """Отправляет сообщение конкретному пользователю/чату в Telegram."""
+    url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
     payload = {
-        "chat_id": cfg.telegram_chat_id,
-        "text": format_deal_card(deal),
+        "chat_id": chat_id,
+        "text": text,
         "parse_mode": "HTML",
         "disable_web_page_preview": False,
     }
 
     try:
-        if client is not None:
-            response = await client.post(url, json=payload)
-        else:
-            async with httpx.AsyncClient(timeout=10.0) as default_client:
-                response = await default_client.post(url, json=payload)
-
+        response = await client.post(url, json=payload)
         if response.status_code == 200:
             data = response.json()
             msg_id = data.get("result", {}).get("message_id", "N/A")
-            logger.info("Telegram notification successfully sent for '%s'", deal.item_name)
-            return True, f"Карточка успешно доставлена в Telegram (message_id: {msg_id})"
+            return True, f"message_id: {msg_id}"
 
-        # Обработка ошибки со стороны Telegram API
         try:
-            error_data = response.json()
-            description = error_data.get("description", response.text)
+            description = response.json().get("description", response.text)
         except Exception:
             description = response.text
-
-        error_msg = f"HTTP {response.status_code}: {description}"
-        logger.error(
-            "HTTP error while sending Telegram notification for '%s': %s",
-            deal.item_name,
-            error_msg,
-        )
-        return False, error_msg
-
+        return False, f"HTTP {response.status_code}: {description}"
     except httpx.HTTPError as exc:
-        error_msg = f"Сетевая ошибка: {exc}"
-        logger.error(
-            "HTTP error while sending Telegram notification for '%s': %s",
+        return False, f"Сетевая ошибка: {exc}"
+
+
+async def send_telegram_deal_notification_with_result(
+    deal: ArbitrageDeal,
+    chat_ids: Sequence[int | str] | None = None,
+    settings: Settings | None = None,
+    client: httpx.AsyncClient | None = None,
+) -> tuple[bool, str]:
+    """Асинхронно рассылает карточку сделки активным подписчикам."""
+    cfg = settings or get_settings()
+
+    if not cfg.telegram_bot_token:
+        logger.warning(
+            "Telegram bot token is missing. Notification skipped for '%s'.",
             deal.item_name,
-            exc,
         )
-        return False, error_msg
+        return False, "Не настроен TELEGRAM_BOT_TOKEN в .env"
+
+    recipients: list[int | str] = []
+    if chat_ids is not None:
+        recipients = list(chat_ids)
+    else:
+        # Извлекаем подписчиков из SQLite базы данных
+        active_db_subscribers = get_active_subscribers(cfg.database_path)
+        if active_db_subscribers:
+            recipients = [sub for sub in active_db_subscribers]
+        elif cfg.telegram_chat_id:
+            # Fallback на одиночный chat_id из конфига (если задан)
+            recipients = [cfg.telegram_chat_id]
+
+    if not recipients:
+        logger.info(
+            "No active Telegram subscribers found. Notification skipped for '%s'.",
+            deal.item_name,
+        )
+        return False, "Список активных подписчиков пуст (нет chat_id в базе данных)"
+
+    text = format_deal_card(deal)
+    successful_deliveries = 0
+    errors: list[str] = []
+
+    async def _send_all(http_client: httpx.AsyncClient) -> None:
+        nonlocal successful_deliveries
+        for cid in recipients:
+            ok, detail = await send_to_single_chat(
+                client=http_client,
+                bot_token=cfg.telegram_bot_token,  # type: ignore[arg-type]
+                chat_id=cid,
+                text=text,
+            )
+            if ok:
+                successful_deliveries += 1
+                logger.info("Alert sent to chat %s: %s", cid, detail)
+            else:
+                errors.append(f"Chat {cid}: {detail}")
+                logger.warning("Failed to send alert to chat %s: %s", cid, detail)
+
+    if client is not None:
+        await _send_all(client)
+    else:
+        async with httpx.AsyncClient(timeout=10.0) as default_client:
+            await _send_all(default_client)
+
+    if successful_deliveries > 0:
+        summary = (
+            f"Успешно доставлено {successful_deliveries}/{len(recipients)} подписчикам "
+            f"для '{deal.item_name}'"
+        )
+        return True, summary
+
+    return False, f"Не удалось доставить: {'; '.join(errors)}"
 
 
 async def send_telegram_deal_notification(
     deal: ArbitrageDeal,
+    chat_ids: Sequence[int | str] | None = None,
     settings: Settings | None = None,
     client: httpx.AsyncClient | None = None,
 ) -> bool:
-    """Асинхронно отправляет карточку сделки в Telegram (булевый флаг для воркера)."""
+    """Асинхронно отправляет карточку сделки подписчикам (булевый флаг для воркера)."""
     success, _ = await send_telegram_deal_notification_with_result(
         deal=deal,
+        chat_ids=chat_ids,
         settings=settings,
         client=client,
     )
@@ -107,7 +147,7 @@ async def send_telegram_deal_notification(
 
 
 class TelegramNotifier:
-    """Класс-обертка для отправки уведомлений."""
+    """Класс-обертка для отправки уведомлений подписчикам."""
 
     def __init__(
         self,
@@ -120,16 +160,26 @@ class TelegramNotifier:
     def format_card(self, deal: ArbitrageDeal) -> str:
         return format_deal_card(deal)
 
-    async def send(self, deal: ArbitrageDeal) -> bool:
+    async def send(
+        self,
+        deal: ArbitrageDeal,
+        chat_ids: Sequence[int | str] | None = None,
+    ) -> bool:
         return await send_telegram_deal_notification(
             deal=deal,
+            chat_ids=chat_ids,
             settings=self.settings,
             client=self.client,
         )
 
-    async def send_with_details(self, deal: ArbitrageDeal) -> tuple[bool, str]:
+    async def send_with_details(
+        self,
+        deal: ArbitrageDeal,
+        chat_ids: Sequence[int | str] | None = None,
+    ) -> tuple[bool, str]:
         return await send_telegram_deal_notification_with_result(
             deal=deal,
+            chat_ids=chat_ids,
             settings=self.settings,
             client=self.client,
         )

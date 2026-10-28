@@ -9,6 +9,7 @@ class Settings(BaseSettings):
     market_fee_percent: float = 15.0
     telegram_bot_token: str | None = None
     telegram_chat_id: str | None = None
+    database_path: str = "subscribers.db"
     check_interval_seconds: float = 2.0
 
     model_config = SettingsConfigDict(
