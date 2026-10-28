@@ -299,9 +299,24 @@ def main() -> None:
         action="store_true",
         help="Показать список всех активных подписчиков",
     )
+    parser.add_argument(
+        "--bot",
+        action="store_true",
+        help="Запустить интерактивного Telegram-бота (aiogram polling)",
+    )
     args = parser.parse_args()
 
     settings = get_settings()
+
+    if args.bot:
+        from bot import start_bot_polling
+
+        console.print("[bold cyan]🤖 Запуск Telegram-бота (aiogram)...[/bold cyan]")
+        try:
+            asyncio.run(start_bot_polling())
+        except KeyboardInterrupt, asyncio.CancelledError:
+            console.print("\n[bold yellow]👋 Бот остановлен пользователем.[/bold yellow]")
+        return
 
     if args.add_subscriber:
         add_subscriber(args.add_subscriber, db_path=settings.database_path)

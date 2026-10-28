@@ -1,9 +1,13 @@
+import hashlib
+from typing import Any
+
 from pydantic import BaseModel, Field
 
 
 class ArbitrageDeal(BaseModel):
     """Pydantic-модель арбитражной сделки по предмету."""
 
+    id: str | None = Field(default=None, description="Уникальный идентификатор сделки")
     item_name: str = Field(..., description="Название предмета")
     buy_price: float = Field(..., gt=0, description="Цена покупки в рублях")
     median_price: float = Field(..., gt=0, description="Медианная цена продажи в рублях")
@@ -13,6 +17,33 @@ class ArbitrageDeal(BaseModel):
         description="Процент чистой выгоды относительно цены покупки",
     )
     link: str = Field(..., description="Прямая ссылка на лот или предмет")
+
+    def model_post_init(self, __context: Any) -> None:
+        if not self.id:
+            raw = f"{self.item_name}_{self.buy_price:.2f}_{self.median_price:.2f}"
+            self.id = hashlib.md5(raw.encode()).hexdigest()[:10]
+            # Автоматически регистрируем в реестре
+            DEAL_REGISTRY[self.id] = self
+
+
+DEAL_REGISTRY: dict[str, ArbitrageDeal] = {}
+
+
+def register_deal(deal: ArbitrageDeal) -> ArbitrageDeal:
+    """Регистрирует сделку в глобальном хранилище активных предложений."""
+    if deal.id:
+        DEAL_REGISTRY[deal.id] = deal
+    return deal
+
+
+def get_deal_by_id(deal_id: str) -> ArbitrageDeal | None:
+    """Возвращает зарегистрированную сделку по её идентификатору."""
+    return DEAL_REGISTRY.get(deal_id)
+
+
+def get_all_registered_deals() -> list[ArbitrageDeal]:
+    """Возвращает все активные зарегистрированные лоты."""
+    return list(DEAL_REGISTRY.values())
 
 
 def calculate_profit(

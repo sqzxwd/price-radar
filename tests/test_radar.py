@@ -439,3 +439,174 @@ async def test_run_test_alert(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(TelegramNotifier, "send_with_details", mock_send_with_details)
     result = await run_test_alert()
     assert result is True
+
+
+def test_build_deal_inline_keyboard() -> None:
+    """Проверка генерации inline-кнопок под карточкой лота."""
+    from notifier import build_deal_inline_keyboard
+
+    deal = ArbitrageDeal(
+        item_name="AWP | Hyper Beast",
+        buy_price=3000.0,
+        median_price=4500.0,
+        net_profit=825.0,
+        profit_percent=27.50,
+        link="https://market.csgo.com/item/hyper-beast",
+    )
+    kb = build_deal_inline_keyboard(deal)
+    assert len(kb.inline_keyboard) == 2
+
+    # Ряд 1: Ссылка на маркет
+    assert kb.inline_keyboard[0][0].text == "🔗 Открыть лот на маркете"
+    assert kb.inline_keyboard[0][0].url == "https://market.csgo.com/item/hyper-beast"
+
+    # Ряд 2: Напомнить и Детали расчета
+    assert kb.inline_keyboard[1][0].text == "⏱ Напомнить через 5 мин"
+    assert kb.inline_keyboard[1][0].callback_data == f"remind:{deal.id}"
+    assert kb.inline_keyboard[1][1].text == "📊 Детали расчета"
+    assert kb.inline_keyboard[1][1].callback_data == f"calc:{deal.id}"
+
+
+def test_build_settings_keyboard() -> None:
+    """Проверка генерации клавиатуры /settings с отметкой активного порога."""
+    from bot import build_settings_keyboard
+
+    kb = build_settings_keyboard(current_threshold=20.0)
+    buttons = kb.inline_keyboard[0]
+    texts = [btn.text for btn in buttons]
+    callbacks = [btn.callback_data for btn in buttons]
+
+    assert texts == ["10%", "15%", "✔ 20%", "25%"]
+    assert callbacks == [
+        "set_threshold:10.0",
+        "set_threshold:15.0",
+        "set_threshold:20.0",
+        "set_threshold:25.0",
+    ]
+
+
+def test_build_deal_breakdown_text() -> None:
+    """Проверка текста детальной разбивки расчета."""
+    from bot import build_deal_breakdown_text
+
+    deal = ArbitrageDeal(
+        item_name="AK-47 | Redline",
+        buy_price=1000.0,
+        median_price=1500.0,
+        net_profit=275.0,
+        profit_percent=27.50,
+        link="https://test.link",
+    )
+    text = build_deal_breakdown_text(deal, fee_percent=15.0)
+    assert "AK-47 | Redline" in text
+    assert "Цена закупки: 1000.00 ₽" in text
+    assert "Медианная цена (24ч): 1500.00 ₽" in text
+    assert "Комиссия площадки (15.0%): -225.00 ₽" in text
+    assert "Выплата продавцу: 1275.00 ₽" in text
+    assert "Чистая маржа: +275.00 ₽ (+27.50%)" in text
+
+
+def test_database_subscriber_threshold(tmp_path: pytest.TempPathFactory) -> None:
+    """Проверка сохранения и чтения персонального порога прибыли."""
+    from database import get_subscriber_threshold, set_subscriber_threshold
+
+    db_file = str(tmp_path / "thresholds.db")
+    assert get_subscriber_threshold(12345, db_path=db_file) == 15.0
+
+    set_subscriber_threshold(12345, 25.0, db_path=db_file)
+    assert get_subscriber_threshold(12345, db_path=db_file) == 25.0
+
+
+@pytest.mark.asyncio
+async def test_bot_callback_calc_and_remind() -> None:
+    """Тестирование обработки callback-запросов calc: и remind:."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot import cb_calc, cb_remind
+
+    deal = ArbitrageDeal(
+        item_name="Test Knife",
+        buy_price=10000.0,
+        median_price=14000.0,
+        net_profit=1900.0,
+        profit_percent=19.0,
+        link="https://test.link",
+    )
+
+    # 1. Тест calc:
+    cb_calc_query = MagicMock()
+    cb_calc_query.data = f"calc:{deal.id}"
+    cb_calc_query.answer = AsyncMock()
+
+    await cb_calc(cb_calc_query)
+    cb_calc_query.answer.assert_awaited_once()
+    assert cb_calc_query.answer.call_args[1].get("show_alert") is True
+    assert "Test Knife" in cb_calc_query.answer.call_args[0][0]
+
+    # 2. Тест remind:
+    cb_remind_query = MagicMock()
+    cb_remind_query.data = f"remind:{deal.id}"
+    cb_remind_query.message = MagicMock()
+    cb_remind_query.message.chat.id = 999
+    cb_remind_query.answer = AsyncMock()
+
+    bot_mock = MagicMock()
+    await cb_remind(cb_remind_query, bot=bot_mock)
+    cb_remind_query.answer.assert_awaited_once_with(
+        "Таймер на 5 минут установлен!",
+        show_alert=False,
+    )
+
+
+@pytest.mark.asyncio
+async def test_schedule_deal_reminder() -> None:
+    """Проверка функции отложенного напоминания с моковым клиентом."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot import schedule_deal_reminder
+
+    deal = ArbitrageDeal(
+        item_name="AK-47 | Redline (Field-Tested)",
+        buy_price=1200.0,
+        median_price=1800.0,
+        net_profit=330.0,
+        profit_percent=27.50,
+        link="https://market.csgo.com/item/ak-47-redline-ft",
+    )
+
+    bot_mock = MagicMock()
+    bot_mock.send_message = AsyncMock()
+
+    success = await schedule_deal_reminder(
+        bot=bot_mock,
+        chat_id=12345,
+        deal=deal,
+        delay_seconds=0,  # без задержки для мгновенного теста
+    )
+    assert success is True
+    bot_mock.send_message.assert_awaited_once()
+    assert "Напоминание: лот все еще в продаже!" in bot_mock.send_message.call_args[1]["text"]
+
+
+@pytest.mark.asyncio
+async def test_bot_commands_active_and_settings() -> None:
+    """Проверка команд /active и /settings."""
+    from unittest.mock import AsyncMock, MagicMock
+
+    from bot import cmd_active, cmd_settings
+
+    # /active
+    msg_active = MagicMock()
+    msg_active.answer = AsyncMock()
+    await cmd_active(msg_active)
+    msg_active.answer.assert_awaited_once()
+    call_text = msg_active.answer.call_args[0][0]
+    assert "Актуальные выгодные лоты" in call_text
+
+    # /settings
+    msg_settings = MagicMock()
+    msg_settings.chat.id = 777
+    msg_settings.answer = AsyncMock()
+    await cmd_settings(msg_settings)
+    msg_settings.answer.assert_awaited_once()
+    assert "Настройки уведомлений" in msg_settings.answer.call_args[0][0]
